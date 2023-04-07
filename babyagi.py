@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import os
 import openai
 import pinecone
@@ -8,9 +7,14 @@ from collections import deque
 from typing import Dict, List
 from dotenv import load_dotenv
 import os
+import discord
+from discord.ext import commands
 
-# Set Variables
 load_dotenv()
+
+# Set Discord bot token
+DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
+assert DISCORD_BOT_TOKEN, "DISCORD_BOT_TOKEN environment variable is missing from .env"
 
 # Set API Keys
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -39,10 +43,6 @@ assert OBJECTIVE, "OBJECTIVE environment variable is missing from .env"
 YOUR_FIRST_TASK = os.getenv("FIRST_TASK", "")
 assert YOUR_FIRST_TASK, "FIRST_TASK environment variable is missing from .env"
 
-#Print OBJECTIVE
-print("\033[96m\033[1m"+"\n*****OBJECTIVE*****\n"+"\033[0m\033[0m")
-print(OBJECTIVE)
-
 # Configure OpenAI and Pinecone
 openai.api_key = OPENAI_API_KEY
 pinecone.init(api_key=PINECONE_API_KEY, environment=PINECONE_ENVIRONMENT)
@@ -61,6 +61,7 @@ index = pinecone.Index(table_name)
 # Task list
 task_list = deque([])
 
+# Functions
 def add_task(task: Dict):
     task_list.append(task)
 
@@ -70,7 +71,6 @@ def get_ada_embedding(text):
 
 def openai_call(prompt: str, model: str = OPENAI_API_MODEL, temperature: float = 0.5, max_tokens: int = 100):
     if not model.startswith('gpt-'):
-        # Use completion API
         response = openai.Completion.create(
             engine=model,
             prompt=prompt,
@@ -82,8 +82,8 @@ def openai_call(prompt: str, model: str = OPENAI_API_MODEL, temperature: float =
         )
         return response.choices[0].text.strip()
     else:
-        # Use chat completion API
         messages=[{"role": "user", "content": prompt}]
+        response = openai.ChatCompletion
         response = openai.ChatCompletion.create(
             model=model,
             messages=messages,
@@ -120,18 +120,22 @@ def prioritization_agent(this_task_id: int):
 
 def execution_agent(objective: str, task: str) -> str:
     context=context_agent(query=objective, n=5)
-    #print("\n*******RELEVANT CONTEXT******\n")
-    #print(context)
     prompt =f"You are an AI who performs one task based on the following objective: {objective}.\nTake into account these previously completed tasks: {context}\nYour task: {task}\nResponse:"
     return openai_call(prompt, temperature=0.7, max_tokens=2000)
 
 def context_agent(query: str, n: int):
     query_embedding = get_ada_embedding(query)
     results = index.query(query_embedding, top_k=n, include_metadata=True)
-    #print("***** RESULTS *****")
-    #print(results)
     sorted_results = sorted(results.matches, key=lambda x: x.score, reverse=True)    
     return [(str(item.metadata['task'])) for item in sorted_results]
+
+async def send_large_message(ctx, content):
+    if len(content) <= 2000:
+        await ctx.send(content)
+    else:
+        parts = [content[i:i+2000] for i in range(0, len(content), 2000)]
+        for part in parts:
+            await ctx.send(part)
 
 # Add the first task
 first_task = {
@@ -140,39 +144,57 @@ first_task = {
 }
 
 add_task(first_task)
-# Main loop
-task_id_counter = 1
-while True:
-    if task_list:
-        # Print the task list
-        print("\033[95m\033[1m"+"\n*****TASK LIST*****\n"+"\033[0m\033[0m")
-        for t in task_list:
-            print(str(t['task_id'])+": "+t['task_name'])
 
-        # Step 1: Pull the first task
-        task = task_list.popleft()
-        print("\033[92m\033[1m"+"\n*****NEXT TASK*****\n"+"\033[0m\033[0m")
-        print(str(task['task_id'])+": "+task['task_name'])
+intents = discord.Intents.default()
+intents.message_content = True
 
-        # Send to execution function to complete the task based on the context
-        result = execution_agent(OBJECTIVE,task["task_name"])
-        this_task_id = int(task["task_id"])
-        print("\033[93m\033[1m"+"\n*****TASK RESULT*****\n"+"\033[0m\033[0m")
-        print(result)
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-        # Step 2: Enrich result and store in Pinecone
-        enriched_result = {'data': result}  # This is where you should enrich the result if needed
-        result_id = f"result_{task['task_id']}"
-        vector = enriched_result['data']  # extract the actual result from the dictionary
-        index.upsert([(result_id, get_ada_embedding(vector),{"task":task['task_name'],"result":result})])
+@bot.event
+async def on_ready():
+    print(f"{bot.user.name} has connected to Discord!")
 
-    # Step 3: Create new tasks and reprioritize task list
-    new_tasks = task_creation_agent(OBJECTIVE,enriched_result, task["task_name"], [t["task_name"] for t in task_list])
+@bot.command()
+async def start(ctx):
+    global task_list
+    task_id_counter = 1
+    while True:
+        if task_list:
+            # Print the task list
+            await ctx.send("**Task List:**")
+            for t in task_list:
+                await ctx.send(str(t['task_id'])+": "+t['task_name'])
 
-    for new_task in new_tasks:
-        task_id_counter += 1
-        new_task.update({"task_id": task_id_counter})
-        add_task(new_task)
-    prioritization_agent(this_task_id)
+            # Step 1: Pull the first task
+            task = task_list.popleft()
+            await ctx.send("**Next Task:**")
+           
+            await ctx.send(str(task['task_id'])+": "+task['task_name'])
 
-    time.sleep(1)  # Sleep before checking the task list again
+            # Step 2: Execute the task
+            objective = OBJECTIVE
+            result = execution_agent(objective, task['task_name'])
+            await ctx.send("**Task Result:**")
+            await send_large_message(ctx, result)
+
+
+            # Step 3: Generate new tasks based on the result
+            new_tasks = task_creation_agent(objective, result, task['task_name'], [t['task_name'] for t in task_list])
+            for new_task in new_tasks:
+                task_id_counter += 1
+                new_task["task_id"] = task_id_counter
+                add_task(new_task)
+
+            # Step 4: Prioritize the tasks
+            prioritization_agent(task["task_id"])
+
+        else:
+            await ctx.send("Task list is empty.")
+            break
+
+@bot.command()
+async def stop(ctx):
+    await ctx.send("Stopping bot...")
+    await bot.logout()
+
+bot.run(DISCORD_BOT_TOKEN)
